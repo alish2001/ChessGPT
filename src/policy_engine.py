@@ -108,11 +108,22 @@ class PolicyEngine:
         self.use_history = self.history_len > 0
         self.device = _detect_device()
         self.move_to_idx = self._load_move_mapping(self.mapping_path)
+        state_dict = torch.load(self.model_path, map_location="cpu")
+        inferred_embed = self._infer_embed_dim(state_dict)
+        inferred_ff = self._infer_ff_dim(state_dict)
+        inferred_layers = self._infer_num_layers(state_dict)
+        embed_dim = int(os.getenv("CHESSGPT_EMBED_DIM", inferred_embed))
+        ff_dim = int(os.getenv("CHESSGPT_FF_DIM", inferred_ff))
+        num_layers = int(os.getenv("CHESSGPT_NUM_LAYERS", inferred_layers))
+        nhead = int(os.getenv("CHESSGPT_NUM_HEADS", "8"))
         self.model = ChessPolicyModel(
             num_moves=len(self.move_to_idx),
             history_length=self.history_len,
+            embed_dim=embed_dim,
+            nhead=nhead,
+            num_layers=num_layers,
+            ff_dim=ff_dim,
         )
-        state_dict = torch.load(self.model_path, map_location="cpu")
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
@@ -124,10 +135,10 @@ class PolicyEngine:
         src_dir = Path(__file__).resolve().parent
         repo_root = src_dir.parent
         self.model_path = Path(
-            os.getenv("CHESSGPT_MODEL_PATH", repo_root / "models" / "chess_policy_modal_hist0.pt")
+            os.getenv("CHESSGPT_MODEL_PATH", repo_root / "models" / "chess_policy_modal_hist0_games8k.pt")
         )
         self.mapping_path = Path(
-            os.getenv("CHESSGPT_MAPPING_PATH", repo_root / "data" / "move_mapping.json")
+            os.getenv("CHESSGPT_MAPPING_PATH", repo_root / "models" / "move_mapping_hist0_games8k.json")
         )
         if not self.model_path.exists():
             raise FileNotFoundError(
@@ -145,6 +156,33 @@ class PolicyEngine:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return {str(move): int(idx) for move, idx in data.items()}
+
+    @staticmethod
+    def _infer_embed_dim(state_dict: Dict[str, torch.Tensor]) -> int:
+        fc_weight = state_dict.get("fc.weight")
+        if fc_weight is None:
+            raise ValueError("Checkpoint missing fc.weight for embed dimension inference.")
+        return fc_weight.shape[1]
+
+    @staticmethod
+    def _infer_ff_dim(state_dict: Dict[str, torch.Tensor]) -> int:
+        for key, value in state_dict.items():
+            if key.endswith("linear1.weight"):
+                return value.shape[0]
+        raise ValueError("Checkpoint missing transformer linear1 weights for ff_dim inference.")
+
+    @staticmethod
+    def _infer_num_layers(state_dict: Dict[str, torch.Tensor]) -> int:
+        max_layer = -1
+        prefix = "transformer.layers."
+        for key in state_dict:
+            if key.startswith(prefix):
+                parts = key.split(".")
+                if len(parts) >= 3 and parts[2].isdigit():
+                    max_layer = max(max_layer, int(parts[2]))
+        if max_layer < 0:
+            raise ValueError("Checkpoint missing transformer layers for num_layers inference.")
+        return max_layer + 1
 
     def select_move(self, board: chess.Board) -> Tuple[chess.Move, Dict[chess.Move, float]]:
         """Return the selected move and a probability distribution over legal moves."""
