@@ -122,13 +122,12 @@ class PolicyEngine:
 
     def _setup_paths(self) -> None:
         src_dir = Path(__file__).resolve().parent
-        chesshacks_root = src_dir.parent
-        training_root = chesshacks_root.parent
+        repo_root = src_dir.parent
         self.model_path = Path(
-            os.getenv("CHESSGPT_MODEL_PATH", training_root / "models" / "chess_policy.pt")
+            os.getenv("CHESSGPT_MODEL_PATH", repo_root / "models" / "chess_policy_modal_hist0.pt")
         )
         self.mapping_path = Path(
-            os.getenv("CHESSGPT_MAPPING_PATH", training_root / "data" / "move_mapping.json")
+            os.getenv("CHESSGPT_MAPPING_PATH", repo_root / "data" / "move_mapping.json")
         )
         if not self.model_path.exists():
             raise FileNotFoundError(
