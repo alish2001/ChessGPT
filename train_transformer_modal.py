@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -258,6 +259,7 @@ def train_model(config: TrainConfig, rank: int, world_size: int) -> None:
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
+    log("Dataset loaded, starting training loop")
     for epoch in range(1, config.epochs + 1):
         log(f"Starting epoch {epoch}/{config.epochs}")
         if train_sampler is not None:
@@ -269,6 +271,8 @@ def train_model(config: TrainConfig, rank: int, world_size: int) -> None:
 
         running_loss = 0.0
         seen = 0
+        first_batch_logged = False
+        loop_start = time.time()
         for board_tokens, history_tokens, targets in progress:
             board_tokens = board_tokens.to(device)
             history_tokens = history_tokens.to(device)
@@ -285,6 +289,12 @@ def train_model(config: TrainConfig, rank: int, world_size: int) -> None:
             batch_size_now = board_tokens.size(0)
             running_loss += loss.item() * batch_size_now
             seen += batch_size_now
+            if is_master and not first_batch_logged:
+                first_batch_logged = True
+                log(
+                    f"Epoch {epoch}: first batch finished after {time.time() - loop_start:.1f}s "
+                    f"(batch_size={batch_size_now})"
+                )
             if is_master:
                 progress.set_postfix(loss=f"{running_loss/max(seen,1):.4f}")
 
