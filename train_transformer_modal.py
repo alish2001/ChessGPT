@@ -1,25 +1,48 @@
 """
-Modal training script for the bespoke ChessGPT transformer (self-contained).
+Modal training script for the bespoke ChessGPT transformer with optional multi-GPU (DDP) support.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import modal
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, random_split
 from tqdm import tqdm
 
 try:
     import chess
 except ImportError as exc:
     raise ImportError("python-chess is required") from exc
+
+
+@dataclass
+class TrainConfig:
+    dataset_path: str
+    mapping_path: str
+    epochs: int
+    batch_size: int
+    embed_dim: int
+    nhead: int
+    num_layers: int
+    ff_dim: int
+    lr: float
+    history_length: int
+    val_split: float
+    model_path: str
+    num_workers: int
+    val_interval: int
+    resume_from: Optional[str]
 
 
 # --- Model + dataset ---------------------------------------------------------
@@ -128,12 +151,13 @@ class ChessPolicyModel(nn.Module):
 
 
 def evaluate(
-    model: ChessPolicyModel,
+    model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
 ) -> float:
-    model.eval()
+    eval_model = model.module if isinstance(model, DDP) else model
+    eval_model.eval()
     total = 0.0
     with torch.no_grad():
         for board_tokens, history_tokens, targets in dataloader:
@@ -141,55 +165,54 @@ def evaluate(
             history_tokens = history_tokens.to(device)
             targets = targets.to(device)
             with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
-                outputs = model(board_tokens, history_tokens if model.use_history else None)
+                outputs = eval_model(board_tokens, history_tokens if eval_model.use_history else None)
                 loss = criterion(outputs, targets)
             total += loss.item() * board_tokens.size(0)
+    eval_model.train()
     return total / len(dataloader.dataset)
 
 
-def train_model(
-    dataset_path: str,
-    mapping_path: str,
-    epochs: int,
-    batch_size: int,
-    embed_dim: int,
-    nhead: int,
-    num_layers: int,
-    ff_dim: int,
-    lr: float,
-    history_length: int,
-    val_split: float,
-    model_path: str,
-    num_workers: int,
-    val_interval: int,
-    resume_from: Optional[str],
-) -> None:
-    with open(mapping_path, "r", encoding="utf-8") as f:
+def train_model(config: TrainConfig, rank: int, world_size: int) -> None:
+    device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(rank)
+    is_master = rank == 0
+
+    def log(*args, **kwargs):
+        if is_master:
+            print(*args, **kwargs)
+
+    with open(config.mapping_path, "r", encoding="utf-8") as f:
         move_to_idx: Dict[str, int] = json.load(f)
     num_moves = len(move_to_idx)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = ChessDataset(dataset_path, history_length, pad_idx=num_moves)
-    if val_split > 0:
-        val_size = max(1, int(len(dataset) * val_split))
+    dataset = ChessDataset(config.dataset_path, config.history_length, pad_idx=num_moves)
+    if config.val_split > 0:
+        val_size = max(1, int(len(dataset) * config.val_split))
         train_dataset, val_dataset = random_split(dataset, [len(dataset) - val_size, val_size])
     else:
         train_dataset, val_dataset = dataset, None
 
     pin_memory = device.type == "cuda"
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        if world_size > 1
+        else None
+    )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
+        batch_size=config.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=config.num_workers,
         pin_memory=pin_memory,
     )
     val_loader = (
         DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=config.batch_size,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=config.num_workers,
             pin_memory=pin_memory,
         )
         if val_dataset
@@ -198,35 +221,46 @@ def train_model(
 
     model = ChessPolicyModel(
         num_moves=num_moves,
-        history_length=history_length,
-        embed_dim=embed_dim,
-        nhead=nhead,
-        num_layers=num_layers,
-        ff_dim=ff_dim,
+        history_length=config.history_length,
+        embed_dim=config.embed_dim,
+        nhead=config.nhead,
+        num_layers=config.num_layers,
+        ff_dim=config.ff_dim,
     ).to(device)
 
-    if resume_from:
-        ckpt_path = Path(resume_from)
-        if ckpt_path.exists():
-            print(f"Loading checkpoint from {ckpt_path}")
-            model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    if config.resume_from:
+        ckpt = Path(config.resume_from)
+        if ckpt.exists():
+            log(f"Loading checkpoint from {ckpt}")
+            state = torch.load(ckpt, map_location=device)
+            model.load_state_dict(state)
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
+
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     criterion = nn.CrossEntropyLoss()
-
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
-    for epoch in range(1, epochs + 1):
-        model.train()
+
+    for epoch in range(1, config.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if is_master:
+            progress = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch", dynamic_ncols=True)
+        else:
+            progress = train_loader
+
         running_loss = 0.0
         seen = 0
-        progress = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch", dynamic_ncols=True)
         for board_tokens, history_tokens, targets in progress:
             board_tokens = board_tokens.to(device)
             history_tokens = history_tokens.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
+            base_model = model.module if isinstance(model, DDP) else model
+            history_arg = history_tokens if base_model.use_history else None
             with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
-                outputs = model(board_tokens, history_tokens if model.use_history else None)
+                outputs = model(board_tokens, history_arg)
                 loss = criterion(outputs, targets)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -234,47 +268,68 @@ def train_model(
             batch_size_now = board_tokens.size(0)
             running_loss += loss.item() * batch_size_now
             seen += batch_size_now
-            progress.set_postfix(loss=f"{running_loss/seen:.4f}")
-        epoch_loss = running_loss / seen
-        print(f"Epoch {epoch} train loss: {epoch_loss:.4f}")
-        if val_loader is not None and (epoch % val_interval == 0 or epoch == epochs):
-            val_loss = evaluate(model, val_loader, criterion, device)
-            print(f"Validation loss: {val_loss:.4f}")
+            if is_master:
+                progress.set_postfix(loss=f"{running_loss/max(seen,1):.4f}")
 
-    torch.save(model.state_dict(), model_path)
-    print(f"Saved model to {model_path}")
+        totals = torch.tensor([running_loss, seen], device=device)
+        if world_size > 1:
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_loss = totals[0].item()
+        total_seen = max(1, int(totals[1].item()))
+        epoch_loss = total_loss / total_seen
+        log(f"Epoch {epoch} train loss: {epoch_loss:.4f}")
+
+        if (
+            val_loader is not None
+            and (epoch % config.val_interval == 0 or epoch == config.epochs)
+            and is_master
+        ):
+            val_loss = evaluate(model, val_loader, criterion, device)
+            log(f"Validation loss: {val_loss:.4f}")
+
+    base_model = model.module if isinstance(model, DDP) else model
+    if is_master:
+        torch.save(base_model.state_dict(), config.model_path)
+        log(f"Saved model to {config.model_path}")
+
+
+def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
+    if world_size > 1:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        train_model(config, rank, world_size)
+    finally:
+        if world_size > 1:
+            dist.destroy_process_group()
 
 
 # --- Modal configuration ------------------------------------------------------
-
-
-import json
-
-
-UV_BIN = "/root/.local/bin/uv"
 
 IMAGE = (
     modal.Image.debian_slim()
     .apt_install("git", "curl")
     .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
     .env({"PATH": f"/root/.local/bin:$PATH"})
-    .run_commands(f"{UV_BIN} venv /root/.uv-env")
+    .run_commands("/root/.local/bin/uv venv /root/.uv-env")
     .env({"PATH": f"/root/.uv-env/bin:$PATH"})
     .run_commands(
-        f"{UV_BIN} pip install --python /root/.uv-env/bin/python "
+        "/root/.local/bin/uv pip install --python /root/.uv-env/bin/python "
         "numpy==2.3.4 torch==2.9.1 tqdm==4.67.1 python-chess==1.999"
     )
 )
 
 DATA_VOLUME = modal.Volume.from_name("chessgpt-datasets", create_if_missing=True)
 OUTPUT_VOLUME = modal.Volume.from_name("chessgpt-models", create_if_missing=True)
+GPU_CONFIG = "A100-40GB:2"
 
 app = modal.App("chessgpt-transformer")
 
 
 @app.function(
     image=IMAGE,
-    gpu="A100-40GB",
+    gpu=GPU_CONFIG,
     timeout=60 * 60 * 12,
     volumes={"/data": DATA_VOLUME, "/outputs": OUTPUT_VOLUME},
 )
@@ -294,12 +349,13 @@ def train_remote(
     num_workers: int,
     val_interval: int,
     resume_from: Optional[str],
+    num_gpus: int,
 ) -> None:
     dataset_path = str(Path("/data") / dataset_file)
     mapping_path = str(Path("/data") / mapping_file)
     output_path = str(Path("/outputs") / f"{model_name}.pt")
-    resume_path = Path("/outputs") / resume_from if resume_from else None
-    train_model(
+    resume_path = str(Path("/outputs") / resume_from) if resume_from else None
+    config = TrainConfig(
         dataset_path=dataset_path,
         mapping_path=mapping_path,
         epochs=epochs,
@@ -314,8 +370,14 @@ def train_remote(
         model_path=output_path,
         num_workers=num_workers,
         val_interval=max(1, val_interval),
-        resume_from=str(resume_path) if resume_path else None,
+        resume_from=resume_path,
     )
+
+    world_size = max(1, num_gpus)
+    if world_size > 1:
+        mp.spawn(train_worker, args=(world_size, config), nprocs=world_size, join=True)
+    else:
+        train_worker(0, 1, config)
     OUTPUT_VOLUME.commit()
 
 
@@ -336,6 +398,7 @@ def main(
     num_workers: int = 8,
     val_interval: int = 2,
     resume_from: str = "",
+    num_gpus: int = 1,
 ) -> None:
     train_remote.remote(
         dataset,
@@ -353,4 +416,5 @@ def main(
         num_workers,
         val_interval,
         resume_from if resume_from else None,
+        num_gpus,
     )
