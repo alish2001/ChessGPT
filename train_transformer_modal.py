@@ -158,6 +158,7 @@ def evaluate(
 ) -> float:
     eval_model = model.module if isinstance(model, DDP) else model
     eval_model.eval()
+    print(f"[Eval] running on {len(dataloader.dataset)} samples")
     total = 0.0
     with torch.no_grad():
         for board_tokens, history_tokens, targets in dataloader:
@@ -169,6 +170,7 @@ def evaluate(
                 loss = criterion(outputs, targets)
             total += loss.item() * board_tokens.size(0)
     eval_model.train()
+    print("[Eval] completed")
     return total / len(dataloader.dataset)
 
 
@@ -182,16 +184,22 @@ def train_model(config: TrainConfig, rank: int, world_size: int) -> None:
         if is_master:
             print(*args, **kwargs)
 
+    log(f"Loading move mapping from {config.mapping_path}")
     with open(config.mapping_path, "r", encoding="utf-8") as f:
         move_to_idx: Dict[str, int] = json.load(f)
     num_moves = len(move_to_idx)
+    log(f"Mapping contains {num_moves} unique moves")
 
+    log(f"Loading dataset from {config.dataset_path}")
     dataset = ChessDataset(config.dataset_path, config.history_length, pad_idx=num_moves)
     if config.val_split > 0:
         val_size = max(1, int(len(dataset) * config.val_split))
         train_dataset, val_dataset = random_split(dataset, [len(dataset) - val_size, val_size])
     else:
         train_dataset, val_dataset = dataset, None
+    log(
+        f"Dataset size total={len(dataset)}, train={len(train_dataset)}, val={len(val_dataset) if val_dataset else 0}"
+    )
 
     pin_memory = device.type == "cuda"
     train_sampler = (
@@ -219,6 +227,14 @@ def train_model(config: TrainConfig, rank: int, world_size: int) -> None:
         else None
     )
 
+    log(
+        f"Train loader batches: {len(train_loader)} | Val loader batches: {len(val_loader) if val_loader else 0}"
+    )
+    if world_size > 1:
+        log(f"Using DistributedDataParallel across {world_size} ranks")
+    else:
+        log("Running on a single device")
+
     model = ChessPolicyModel(
         num_moves=num_moves,
         history_length=config.history_length,
@@ -240,9 +256,10 @@ def train_model(config: TrainConfig, rank: int, world_size: int) -> None:
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     for epoch in range(1, config.epochs + 1):
+        log(f"Starting epoch {epoch}/{config.epochs}")
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         if is_master:
