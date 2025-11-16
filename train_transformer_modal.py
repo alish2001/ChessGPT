@@ -164,7 +164,7 @@ def evaluate(
             board_tokens = board_tokens.to(device)
             history_tokens = history_tokens.to(device)
             targets = targets.to(device)
-            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            with torch.amp.autocast("cuda"):
                 outputs = eval_model(board_tokens, history_tokens if eval_model.use_history else None)
                 loss = criterion(outputs, targets)
             total += loss.item() * board_tokens.size(0)
@@ -240,7 +240,7 @@ def train_model(config: TrainConfig, rank: int, world_size: int) -> None:
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda")
 
     for epoch in range(1, config.epochs + 1):
         if train_sampler is not None:
